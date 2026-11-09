@@ -20,7 +20,7 @@ interface VideoPlayerProps {
 
 const CONTAINER_ID = 'yt-player-container';
 const SPEEDS = [0.5, 1, 1.25, 1.5, 2];
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 function VideoPlayerImpl({
   videoId,
@@ -132,6 +132,15 @@ function VideoPlayerImpl({
       startLoop(adapter);
     },
     [externalPlayerRef, startLoop]
+  );
+
+  // Stable ref callback: an inline one would re-bind the player (and restart the rAF loop) on every render.
+  const setVideoEl = useCallback(
+    (el: HTMLVideoElement | null) => {
+      videoElRef.current = el;
+      if (el) bindHtml5Player(el);
+    },
+    [bindHtml5Player]
   );
 
   const { initPlayer } = useYouTubePlayer({
@@ -255,10 +264,7 @@ function VideoPlayerImpl({
         {isSocial && (
           <video
             key={`${videoId}_${retryCount}`}
-            ref={(el) => {
-              videoElRef.current = el;
-              if (el) bindHtml5Player(el);
-            }}
+            ref={setVideoEl}
             src={`${API_BASE}/api/preview?url=${encodeURIComponent(socialTargetUrl)}&r=${retryCount}`}
             playsInline
             preload="auto"
@@ -305,8 +311,9 @@ function VideoPlayerImpl({
           <div className="ct-overlay is-error" role="alert">
             <p className="ct-overlay-title">The preview can’t play this video</p>
             <p>
-              It may be private, age-restricted or blocked from embedding. You can still try downloading a clip if the
-              video is public.
+              {isSocial
+                ? 'The preview stream didn’t load. Reload the page and try again. Downloading a clip may still work.'
+                : 'It may be private, age-restricted or blocked from embedding. You can still try downloading a clip if the video is public.'}
             </p>
           </div>
         )}
@@ -328,7 +335,7 @@ function VideoPlayerImpl({
           <span>{fmt(duration, false, duration >= 3600)}</span>
         </span>
         <span className="ct-spacer" />
-        <button type="button" className="ct-chip-btn" onClick={cycleSpeed} title="Change playback speed">
+        <button type="button" className="ct-chip-btn" onClick={cycleSpeed} title="Change playback speed" aria-label={`Playback speed ${speed}x, click to change`}>
           {speed}x
         </button>
         <button

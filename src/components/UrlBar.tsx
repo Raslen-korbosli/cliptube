@@ -34,7 +34,8 @@ export default function UrlBar({
   }, [url]);
 
   useEffect(() => {
-    if (!videoId) {
+    // Don't pop the on-screen keyboard on touch devices.
+    if (!videoId && window.matchMedia('(pointer: fine)').matches) {
       inputRef.current?.focus();
     }
   }, [videoId]);
@@ -83,7 +84,7 @@ export default function UrlBar({
     setInput('');
     setError('');
     onClear?.();
-    inputRef.current?.focus();
+    if (window.matchMedia('(pointer: fine)').matches) inputRef.current?.focus();
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -114,6 +115,8 @@ export default function UrlBar({
           className="ct-url-input"
           type="url"
           inputMode="url"
+          enterKeyHint="go"
+          name="video-url"
           autoComplete="off"
           spellCheck={false}
           value={input}
@@ -123,9 +126,10 @@ export default function UrlBar({
           }}
           onKeyDown={onKeyDown}
           onPaste={handlePaste}
-          placeholder="Paste a YouTube, TikTok, or Instagram link…"
+          placeholder="Paste a link, e.g. tiktok.com/@name/video/…"
           aria-label="Video link"
           aria-invalid={Boolean(error)}
+          aria-describedby={error ? 'ct-url-error' : undefined}
         />
         {(input || videoId) && (
           <button
@@ -138,13 +142,13 @@ export default function UrlBar({
             <X size={16} />
           </button>
         )}
-        <button type="button" className="ct-btn ct-btn-quiet" onClick={pasteFromClipboard}>
+        <button type="button" className="ct-btn ct-btn-quiet" onClick={pasteFromClipboard} aria-label="Paste link from clipboard">
           <Clipboard size={15} />
           <span className="ct-hide-sm">Paste</span>
         </button>
         <button type="button" className="ct-btn ct-btn-primary" onClick={() => submit()} disabled={isLoading}>
           {isLoading ? <Loader2 size={16} className="ct-spin" /> : null}
-          Load video
+          Load Video
         </button>
       </div>
 
@@ -162,11 +166,15 @@ export default function UrlBar({
             <span className="ct-dot ct-dot-ig" />
             Instagram Reels
           </span>
+          <span className="ct-platform-pill">
+            <span className="ct-dot ct-dot-fb" />
+            Facebook
+          </span>
         </div>
       )}
 
       {error && (
-        <p className="ct-field-error" role="alert">
+        <p id="ct-url-error" className="ct-field-error" role="alert">
           {error}
         </p>
       )}
@@ -178,7 +186,8 @@ export default function UrlBar({
               className="ct-thumb"
               src={thumbSrc}
               alt=""
-              loading="lazy"
+              width={96}
+              height={54}
               onError={(e) => {
                 e.currentTarget.style.display = 'none';
               }}
@@ -186,7 +195,7 @@ export default function UrlBar({
           )}
           <div className="ct-meta-text">
             <div className="ct-meta-row">
-              <span className={`ct-badge ct-badge-${platform || 'youtube'}`}>
+              <span className={`ct-badge ct-badge-${platform || 'youtube'}`} translate="no">
                 {platformLabel}
               </span>
               {videoTitle ? (

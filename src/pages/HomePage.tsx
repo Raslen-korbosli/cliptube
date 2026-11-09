@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, Sparkles, X } from 'lucide-react';
+import { AlertCircle, CheckCircle2, X } from 'lucide-react';
 import UrlBar from '../components/UrlBar';
 import VideoPlayer from '../components/VideoPlayer';
 import TrimRangeSlider from '../components/TrimRangeSlider';
@@ -25,7 +25,7 @@ const SEEK_THROTTLE_MS = 140;
 function describeMode(mode: string): string {
   if (!mode) return 'done';
   if (mode.includes('parallel-fetch')) return 'fast mode';
-  if (mode.includes('ytdlp')) return 'standard mode';
+  if (mode.includes('yt-dlp') || mode.includes('ytdlp')) return 'standard mode';
   if (mode.includes('direct')) return 'direct mode';
   if (mode.includes('social')) return 'optimized mode';
   return mode;
@@ -100,7 +100,7 @@ export default function HomePage({ onVideoLoadStateChange }: HomePageProps = {})
 
       if (!res.ok) {
         if (res.status === 502 || res.status === 503) {
-          throw new Error('The server isn’t running. Start it with "npm run dev" and try again.');
+          throw new Error('The server isn’t running. Start it with “npm run dev” and try again.');
         }
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || 'Couldn’t read this video’s details.');
@@ -288,7 +288,8 @@ export default function HomePage({ onVideoLoadStateChange }: HomePageProps = {})
       const el = e.target as HTMLElement | null;
       const tag = el?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'textarea' || tag === 'select' || el?.isContentEditable) return;
-      if (el?.getAttribute('role') === 'slider') return;
+      const role = el?.getAttribute('role');
+      if (role === 'slider' || role === 'radio' || role === 'switch') return;
 
       if (e.code === 'Space') {
         if (tag === 'button') return;
@@ -361,7 +362,7 @@ export default function HomePage({ onVideoLoadStateChange }: HomePageProps = {})
 
       if (!response.ok) {
         if (response.status === 502 || response.status === 503) {
-          throw new Error('The server isn’t running. Start it with "npm run dev" and try again.');
+          throw new Error('The server isn’t running. Start it with “npm run dev” and try again.');
         }
         if (response.status === 429) {
           throw new Error('Too many requests. Wait a moment and try again.');
@@ -440,7 +441,7 @@ export default function HomePage({ onVideoLoadStateChange }: HomePageProps = {})
 
       setDownloadProgress(100);
       const extra = result as DoneExtras;
-      const size = result.sizeMB ? `${result.sizeMB} MB` : 'Clip';
+      const size = result.sizeMB ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(result.sizeMB)}\u00A0MB` : 'Clip';
       const took = result.elapsed ? ` in ${result.elapsed}s` : '';
       const qualityNote = extra.downgraded
         ? ` ${extra.requestedQuality || 'HD'} was unavailable, so it was saved at ${extra.actualQuality}.`
@@ -471,14 +472,16 @@ export default function HomePage({ onVideoLoadStateChange }: HomePageProps = {})
   const canDownload = Boolean(url) && startSeconds < endSeconds && clipSeconds <= APP_CONFIG.maxClipSeconds;
 
   return (
-    <div className={`ct-wrap ${hasVideo ? 'is-workspace' : 'is-landing'}`}>
+    <div id="main" tabIndex={-1} className={`ct-wrap ${hasVideo ? 'is-workspace' : 'is-landing'}`}>
+      {hasVideo && <h1 className="ct-sr">Clip editor</h1>}
       {!hasVideo && (
         <div className="ct-intro ct-hero-intro">
           <div className="ct-hero-badge">
-            <Sparkles size={14} />
-            <span>YouTube · TikTok · Instagram Trimmer</span>
+            <span translate="no">YouTube · TikTok · Instagram . Facebook</span> Trimmer
           </div>
-          <h1>Download just the part you need</h1>
+          <h1>
+            Download <mark>just the part</mark> you need
+          </h1>
           <p>
             Paste a link from YouTube, TikTok, or Instagram, trim the exact moment you want, and export it as MP4 or
             MP3. Instant &amp; no account needed.

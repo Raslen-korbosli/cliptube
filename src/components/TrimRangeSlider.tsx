@@ -82,7 +82,8 @@ function TimeField({ label, value, min, max, step, hours, shortcut, onCommit, on
           id={`ct-tc-${label}`}
           className="ct-field-input"
           type="text"
-          inputMode="decimal"
+          inputMode="text"
+          name={`tc-${label.toLowerCase()}`}
           autoComplete="off"
           spellCheck={false}
           value={text}
@@ -356,7 +357,7 @@ function TrimRangeSliderImpl({
         <div className="ct-tools">
           <button type="button" className="ct-tool" aria-pressed={zoom} onClick={toggleZoom} disabled={duration <= 0}>
             {zoom ? <ZoomOut size={15} /> : <ZoomIn size={15} />}
-            {zoom ? 'Show full video' : 'Zoom to selection'}
+            {zoom ? 'Show Full Video' : 'Zoom to Selection'}
           </button>
           {zoom && (
             <button type="button" className="ct-tool" onClick={fitView}>
@@ -364,7 +365,7 @@ function TrimRangeSliderImpl({
             </button>
           )}
           <button type="button" className="ct-tool" aria-pressed={fine} onClick={() => setFine((f) => !f)}>
-            Fine steps (0.1s)
+            Fine Steps (0.1 s)
           </button>
           <button type="button" className="ct-tool" onClick={onReset}>
             <RotateCcw size={14} />
@@ -377,7 +378,7 @@ function TrimRangeSliderImpl({
           </span>
           <button type="button" className="ct-btn ct-btn-sm" onClick={onPlayPause}>
             {isPlaying ? <Pause size={15} fill="currentColor" /> : <Play size={15} fill="currentColor" />}
-            {isPlaying ? 'Pause' : 'Preview clip'}
+            {isPlaying ? 'Pause' : 'Preview Clip'}
           </button>
         </div>
       </div>

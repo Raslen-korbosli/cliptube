@@ -29,7 +29,7 @@ const MB_PER_SECOND: Record<string, number> = { '1080p': 0.7, '720p': 0.35, '360
 function estimateSize(seconds: number, format: ClipFormat, quality: ClipQuality): string {
   const rate = format === 'mp3' ? 0.024 : MB_PER_SECOND[quality] ?? 0.35;
   const mb = seconds * rate;
-  return mb < 1 ? 'under 1 MB' : `about ${Math.round(mb)} MB`;
+  return mb < 1 ? 'under 1\u00A0MB' : `about ${new Intl.NumberFormat().format(Math.round(mb))}\u00A0MB`;
 }
 
 export default function ExportPanel({
@@ -80,12 +80,26 @@ export default function ExportPanel({
             <span className="ct-block-label" id="ct-quality-label">
               Quality
             </span>
-            <div className="ct-options" role="radiogroup" aria-labelledby="ct-quality-label">
+            <div
+              className="ct-options"
+              role="radiogroup"
+              aria-labelledby="ct-quality-label"
+              onKeyDown={(e) => {
+                if (isDownloading || !['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft'].includes(e.key)) return;
+                e.preventDefault();
+                const group = e.currentTarget;
+                const i = QUALITIES.findIndex((q) => q.value === quality);
+                const step = e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : -1;
+                onQuality(QUALITIES[(i + step + QUALITIES.length) % QUALITIES.length].value);
+                requestAnimationFrame(() => group.querySelector<HTMLElement>('[aria-checked="true"]')?.focus());
+              }}
+            >
               {QUALITIES.map((q) => (
                 <button
                   key={q.value}
                   type="button"
                   role="radio"
+                  tabIndex={quality === q.value ? 0 : -1}
                   aria-checked={quality === q.value}
                   className="ct-option"
                   disabled={isDownloading}
@@ -101,7 +115,7 @@ export default function ExportPanel({
             </div>
             {quality === '1080p' && (
               <p className="ct-footnote">
-                If YouTube refuses 1080p for a video, the clip is saved at 720p and you’ll be told.
+                If the source refuses 1080p for a video, the clip is saved at 720p and you’ll be told.
               </p>
             )}
           </div>
@@ -111,7 +125,7 @@ export default function ExportPanel({
               <p className="ct-switch-title" id="ct-exact-label">
                 Exact cut
               </p>
-              <p className="ct-footnote">
+              <p className="ct-footnote" id="ct-exact-desc">
                 {exactCut
                   ? 'Cuts on the exact frame. Takes longer because the video is re-encoded.'
                   : 'Fast. The cut can land 1 to 3 seconds off because it snaps to the nearest keyframe.'}
@@ -122,6 +136,7 @@ export default function ExportPanel({
               role="switch"
               aria-checked={exactCut}
               aria-labelledby="ct-exact-label"
+              aria-describedby="ct-exact-desc"
               className="ct-switch"
               disabled={isDownloading}
               onClick={() => onExactCut(!exactCut)}
@@ -149,8 +164,17 @@ export default function ExportPanel({
         </p>
       )}
 
-      <button type="button" className="ct-cta" onClick={onDownload} disabled={!canDownload || isDownloading}>
-        {isDownloading && progress > 0 && <span className="ct-cta-fill" style={{ width: `${progress}%` }} />}
+      <span className="ct-sr" role="status" aria-live="polite">
+        {isDownloading ? stage : ''}
+      </span>
+      <button
+        type="button"
+        className="ct-cta"
+        aria-busy={isDownloading}
+        onClick={onDownload}
+        disabled={!canDownload || isDownloading}
+      >
+        {isDownloading && progress > 0 && <span className="ct-cta-fill" style={{ transform: `scaleX(${progress / 100})` }} />}
         <span className="ct-cta-inner">
           {isDownloading ? <Loader2 size={18} className="ct-spin" /> : <Download size={18} strokeWidth={2.4} />}
           <span className="ct-cta-label">{ctaLabel}</span>
