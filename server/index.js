@@ -1,11 +1,30 @@
 /**
- * ClipTube Backend Server — v4.1 (YouTube, TikTok, Instagram, Facebook — Pure Fast Parallel Path)
+ * ClipTube Backend Server — v5 (YouTube, TikTok, Instagram, Facebook)
  *
  * Fast path:  yt-dlp -j (stream URLs + the exact HTTP headers yt-dlp uses)
- *             → probe each player client → parallel range proxy + parallel ffmpeg (video + audio) → local mux
- * Preview:    Direct HTTP Range proxy over the extracted CDN URL (zero disk download)
+ *             → probe each player client → parallel ffmpeg (video + audio) → local mux
  * Exact mode: one ffmpeg pass, both remote inputs, hardware/ultrafast re-encode
- * Fallback:   yt-dlp --download-sections (used only if the fast path is rejected or stalls)
+ * Fallback:   yt-dlp --download-sections (used whenever the fast path is rejected or stalls)
+ *
+ * Endpoints:
+ *   POST /api/info          → video metadata (cached) + pre-warms stream URLs for 720p
+ *   GET  /api/preview?url=  → playable preview of a TikTok/Instagram/Facebook video (Range supported)
+ *   POST /api/clip          → start clip job → { clipId }
+ *   GET  /api/progress/:id  → SSE progress stream
+ *   GET  /api/download/:id  → download completed clip
+ *   GET  /api/health        → server status
+ *
+ * Optional .env variables:
+ *   USE_DIRECT_FFMPEG=true|false        (default true)
+ *   YTDLP_PLAYER_CLIENTS=default,tv,android_vr,mweb   (order to try)
+ *   MAX_CLIENT_ATTEMPTS=3
+ *   YTDLP_COOKIES_FROM_BROWSER=firefox  (optional, off by default)
+ *   YTDLP_COOKIES_FILE=C:\\path\\cookies.txt  (optional; wins over the browser option)
+ *   PARALLEL_FETCH=true|false  FETCH_CONNECTIONS=8  FETCH_CHUNK_MB=2   (YouTube parallel fetch)
+ *   QUALITY_FALLBACK=true|false         (YouTube: retry 720p when 1080p is refused)
+ *
+ * Sites: YouTube (fast parallel path), TikTok, Instagram, Facebook (direct stream, yt-dlp fallback).
+ * Instagram and some Facebook/TikTok videos need a logged-in session: set one of the cookie options.
  */
 
 import express from 'express';
@@ -17,7 +36,6 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { Readable } from 'node:stream';
 
 dotenv.config();
 
@@ -28,18 +46,18 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 
 const USE_DIRECT_FFMPEG = (process.env.USE_DIRECT_FFMPEG ?? 'true').toLowerCase() !== 'false';
 const COOKIES_FROM_BROWSER = (process.env.YTDLP_COOKIES_FROM_BROWSER || '').trim();
-const COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim();
-// android_vr and tv serve native 1080p H.264 (avc1) direct streams without SABR throttling
-const PLAYER_CLIENTS = (process.env.YTDLP_PLAYER_CLIENTS || 'android_vr,tv,default,mweb')
+const COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || '').trim(); // Netscape cookies.txt (wins over the browser option)
+const PLAYER_CLIENTS = (process.env.YTDLP_PLAYER_CLIENTS || 'default,tv,android_vr,mweb')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-const MAX_CLIENT_ATTEMPTS = parseInt(process.env.MAX_CLIENT_ATTEMPTS || '4', 10);
+const MAX_CLIENT_ATTEMPTS = parseInt(process.env.MAX_CLIENT_ATTEMPTS || '3', 10);
+// When 1080p stream URLs are refused (403), retry the fast path at 720p before using the slow yt-dlp download.
 const QUALITY_FALLBACK = (process.env.QUALITY_FALLBACK ?? 'true').toLowerCase() !== 'false';
 
-const STALL_TIMEOUT_MS = 20_000;
-const PROBE_TIMEOUT_MS = 8_000;
-const DIRECT_FAIL_LIMIT = 2;
+const STALL_TIMEOUT_MS = 20_000;       // kill direct fetch if no ffmpeg output for this long
+const PROBE_TIMEOUT_MS = 8_000;        // HTTP probe of a stream URL
+const DIRECT_FAIL_LIMIT = 2;           // consecutive direct failures before cooldown
 const DIRECT_COOLDOWN_MS = 30 * 60_000;
 
 const TEMP_DIR = path.join(os.tmpdir(), 'cliptube_temp');
@@ -53,17 +71,15 @@ let resolvedFfmpeg = 'ffmpeg';
 let resolvedFfmpegDir = null;
 let detectedEncoder = 'libx264';
 let encoderLabel = 'libx264 (software, ultrafast)';
-let jsRuntime = null;
-let supportsJsRuntimes = false;
-let workingClient = null;
+let jsRuntime = null;            // 'deno' | 'node' | null
+let supportsJsRuntimes = false;  // detected from `yt-dlp --help`
+let workingClient = null;        // player client that last passed the probe
 let directFailStreak = 0;
 let directDisabledUntil = 0;
 
 // ─── Caches ─────────────────────────────────────────────────────────────────
-const infoCache = new Map();          // videoId → { data, ts }
-const streamCache = new Map();        // `${videoId}_${height}_${kind}` → { streams, client, ts }
-const previewStreamCache = new Map(); // videoId → { stream, ts }
-const aliasToUrl = new Map();         // frontend id (tt_..., ig_..., fb_...) → full URL
+const infoCache = new Map();     // videoId → { data, ts }
+const streamCache = new Map();   // `${videoId}_${height}_${kind}` → { streams, client, ts }
 const INFO_TTL = 30 * 60_000;
 const STREAM_TTL = 20 * 60_000;
 
@@ -71,15 +87,16 @@ function extractVideoId(url) {
   if (!url) return null;
   const t = String(url).trim();
   if (/^[A-Za-z0-9_-]{11}$/.test(t)) return t;
-  const m = t.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/);
+  const m = t.match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([A-Za-z0-9_-]{11})/);
   return m ? m[1] : null;
 }
 
 // ─── Supported sites ────────────────────────────────────────────────────────
+// Only these hosts are ever handed to yt-dlp / ffmpeg (so the server can't be used to fetch arbitrary URLs).
 const PLATFORM_HOSTS = {
   youtube: ['youtube.com', 'youtu.be', 'youtube-nocookie.com'],
   tiktok: ['tiktok.com'],
-  instagram: ['instagram.com', 'instagr.am'],
+  instagram: ['instagram.com'],
   facebook: ['facebook.com', 'fb.watch', 'fb.com'],
 };
 const UNSUPPORTED_MSG = 'That link isn’t supported. Use a YouTube, TikTok, Instagram or Facebook video link.';
@@ -89,18 +106,16 @@ function hostMatches(host, domain) {
 }
 
 /**
- * Identify and normalise a pasted link (or frontend alias ID).
- * Returns { platform, url, key } or null.
+ * Identify and normalise a pasted link.
+ * Returns { platform, url, key } or null. `key` is the YouTube id, or a short hash for other sites
+ * (used for the info/stream caches).
  */
 function resolveMedia(raw) {
   if (!raw || typeof raw !== 'string') return null;
-  let t = raw.trim();
+  const t = raw.trim();
   if (!t || t.length > 2048) return null;
 
-  if (aliasToUrl.has(t)) t = aliasToUrl.get(t);
-  else if (/^ig_([A-Za-z0-9_-]+)$/i.test(t)) t = `https://www.instagram.com/reel/${t.slice(3)}/`;
-  else if (/^tt_(\d+)$/i.test(t)) t = `https://www.tiktok.com/@_/video/${t.slice(3)}`;
-
+  // A bare YouTube id.
   if (/^[A-Za-z0-9_-]{11}$/.test(t)) {
     return { platform: 'youtube', url: `https://www.youtube.com/watch?v=${t}`, key: t };
   }
@@ -121,23 +136,10 @@ function resolveMedia(raw) {
     return key ? { platform, url, key } : null;
   }
 
-  if (u.pathname.length <= 1 && !u.search) return null;
+  if (u.pathname.length <= 1 && !u.search) return null; // just the site's home page
   u.hash = '';
   const url = u.href;
   const key = `${platform}_${crypto.createHash('sha1').update(url).digest('hex').slice(0, 16)}`;
-  aliasToUrl.set(key, url);
-
-  // Map frontend short IDs (tt_..., ig_..., fb_...) to the full URL for /api/preview
-  const ttMatch = url.match(/\/(?:video|v|photo)\/(\d+)/);
-  if (platform === 'tiktok' && ttMatch) aliasToUrl.set(`tt_${ttMatch[1]}`, url);
-  const igMatch = url.match(/\/(?:reels?|p|tv)\/([A-Za-z0-9_-]+)/i);
-  if (platform === 'instagram' && igMatch) aliasToUrl.set(`ig_${igMatch[1]}`, url);
-  const fbMatch =
-    url.match(/\/(?:videos|reel|watch\/?\?v=)(\d+)/i) ||
-    url.match(/\/share\/(?:v|r)\/([A-Za-z0-9_-]+)/i) ||
-    url.match(/fb\.watch\/([A-Za-z0-9_-]+)/i);
-  if (platform === 'facebook' && fbMatch) aliasToUrl.set(`fb_${fbMatch[1]}`, url);
-
   return { platform, url, key };
 }
 
@@ -163,7 +165,6 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, v] of infoCache) { if (now - v.ts > INFO_TTL) infoCache.delete(k); }
   for (const [k, v] of streamCache) { if (now - v.ts > STREAM_TTL) streamCache.delete(k); }
-  for (const [k, v] of previewStreamCache) { if (now - v.ts > STREAM_TTL) previewStreamCache.delete(k); }
 }, 60_000);
 
 // ─── Direct-path health (cooldown after repeated failures) ──────────────────
@@ -294,7 +295,7 @@ function cleanYouTubeUrl(url) {
 function isValidYouTubeUrl(url) {
   if (!url || typeof url !== 'string') return false;
   const t = url.trim();
-  return /^(https?:\/\/)?(www\.|m\.)?(youtube\.com\/(watch\?.*v=|shorts\/|embed\/|live\/)|youtu\.be\/)[A-Za-z0-9_-]{11}/.test(t)
+  return /^(https?:\/\/)?(www\.|m\.)?(youtube\.com\/(watch\?.*v=|shorts\/|embed\/)|youtu\.be\/)[A-Za-z0-9_-]{11}/.test(t)
     || /^[A-Za-z0-9_-]{11}$/.test(t);
 }
 
@@ -320,6 +321,7 @@ function mkErr(message, fatal = false) {
   return e;
 }
 
+/** Turn yt-dlp stderr into a friendly error. `fatal` = no point trying other methods. */
 function mapYtDlpError(stderr) {
   const lo = stderr.toLowerCase();
   const last = stderr.trim().split('\n').pop() || 'yt-dlp failed';
@@ -426,6 +428,7 @@ async function checkYtDlpVersion() {
   });
 }
 
+/** --js-runtimes only exists in recent yt-dlp builds, so ask the binary instead of guessing from the date. */
 async function detectJsRuntimeSupport() {
   return new Promise(resolve => {
     const c = spawn(resolvedYtDlp, ['--help'], { windowsHide: true });
@@ -441,39 +444,33 @@ async function detectJsRuntime() {
     jsRuntime = 'deno';
     console.log('  • JS runtime: deno ✓');
   } else if (await checkBinary('node', ['--version'])) {
-    jsRuntime = 'node';
+    jsRuntime = 'node';   // yt-dlp calls it "node", not "nodejs"
     console.log('  • JS runtime: node ✓');
   } else {
     console.warn('  ⚠️  No JS runtime for yt-dlp. Install: winget install DenoLand.Deno');
   }
 }
 
-/** Test-encode 1 blank frame so we only pick a hardware encoder that actually works on this GPU. */
-function testEncoder(args) {
-  return new Promise((resolve) => {
-    const c = spawn(
-      resolvedFfmpeg,
-      ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=128x128:d=0.1', '-frames:v', '1', ...args, '-f', 'null', '-'],
-      { windowsHide: true }
-    );
-    c.on('close', (code) => resolve(code === 0));
-    c.on('error', () => resolve(false));
-  });
-}
-
 async function detectEncoder() {
-  for (const { name, label, args } of [
-    { name: 'h264_nvenc', label: 'NVIDIA NVENC', args: ['-c:v', 'h264_nvenc', '-preset', 'p1', '-cq', '23'] },
-    { name: 'h264_qsv', label: 'Intel QuickSync', args: ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-global_quality', '23'] },
-    { name: 'h264_amf', label: 'AMD AMF', args: ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23'] },
-    { name: 'h264_videotoolbox', label: 'Apple VideoToolbox', args: ['-c:v', 'h264_videotoolbox', '-q:v', '65'] },
-  ]) {
-    if (await testEncoder(args)) {
-      detectedEncoder = name;
-      encoderLabel = `${name} (${label})`;
-      return;
-    }
-  }
+  return new Promise(resolve => {
+    try {
+      const c = spawn(resolvedFfmpeg, ['-encoders', '-hide_banner'], { windowsHide: true });
+      let out = '';
+      c.stdout.on('data', d => { out += d; });
+      c.on('close', () => {
+        for (const { name, label } of [
+          { name: 'h264_nvenc', label: 'NVIDIA NVENC' },
+          { name: 'h264_qsv', label: 'Intel QuickSync' },
+          { name: 'h264_amf', label: 'AMD AMF' },
+          { name: 'h264_videotoolbox', label: 'Apple VideoToolbox' },
+        ]) {
+          if (out.includes(name)) { detectedEncoder = name; encoderLabel = `${name} (${label})`; break; }
+        }
+        resolve();
+      });
+      c.on('error', () => resolve());
+    } catch { resolve(); }
+  });
 }
 
 function getEncoderArgs() {
@@ -500,6 +497,7 @@ async function detectHttpOptions() {
       for (const o of HTTP_OPTION_DEFAULTS) {
         if (new RegExp(`-${o}\\b`).test(out)) opts.add(o);
       }
+      // If the help output could not be parsed, fall back to the long-standing options.
       supportedHttpOptions = opts.size ? opts : new Set(HTTP_OPTION_DEFAULTS);
       console.log(`  • ffmpeg protocol options: ${Array.from(supportedHttpOptions).join(', ')}`);
       resolve();
@@ -522,42 +520,14 @@ function clientArgs(client) {
   return ['--extractor-args', `youtube:player_client=${client}`];
 }
 
-/**
- * Format selector for the fast parallel downloader:
- * - For 1080p, explicitly tries `height>720` (horizontal) and `width>720` (vertical 9:16) FIRST
- *   so yt-dlp does not settle for a 720p avc1 stream when 1080p is available.
- * - For TikTok / Instagram / Facebook, prefers H.264 (`h264`/`avc1`) at the requested resolution
- *   so `-c copy` and browser preview work without re-encoding.
- */
 function buildFormat(heightLimit, isMp3, platform = 'youtube') {
   if (platform !== 'youtube') {
+    // TikTok / Instagram / Facebook: codecs and heights vary, so stay generic ("<=?" keeps formats with unknown height).
     if (isMp3) return 'ba/b';
-    if (heightLimit >= 1080) {
-      return [
-        'bv*[vcodec^=avc1][height>720]+ba/bv*[vcodec^=h264][height>720]+ba',
-        'b[vcodec^=h264][width>720]/b[vcodec^=avc1][width>720]',
-        'b[vcodec^=h264]/b[vcodec^=avc1]',
-        'bv*+ba/b',
-      ].join('/');
-    }
-    return `bv*[vcodec^=avc1][width<=?${heightLimit}]+ba/b[vcodec^=h264][width<=?${heightLimit}]/bv*[height<=?${heightLimit}]+ba/b[height<=?${heightLimit}]/bv*+ba/b`;
+    return `bv*[height<=?${heightLimit}]+ba/b[height<=?${heightLimit}]/bv*+ba/b`;
   }
-
   if (isMp3) return 'ba[ext=m4a]/ba';
-
-  if (heightLimit >= 1080) {
-    return [
-      'bv*[vcodec^=avc1][height<=1080][height>720]+ba[ext=m4a]',
-      'bv*[vcodec^=avc1][width<=1080][width>720]+ba[ext=m4a]',
-      'bv*[vcodec^=avc1][height<=1080][height>720]+ba',
-      'bv*[height<=1080][height>720]+ba[ext=m4a]',
-      'bv*[width<=1080][width>720]+ba[ext=m4a]',
-      'bv*[vcodec^=avc1][height<=1080]+ba[ext=m4a]',
-      'bv*[height<=1080]+ba/b[height<=1080]/b',
-    ].join('/');
-  }
-
-  return `bv*[vcodec^=avc1][height<=${heightLimit}]+ba[ext=m4a]/bv*[vcodec^=avc1][width<=${heightLimit}]+ba[ext=m4a]/bv*[vcodec^=avc1][height<=${heightLimit}]+ba/bv*[height<=${heightLimit}]+ba/b[height<=${heightLimit}]/b`;
+  return `bv*[vcodec^=avc1][height<=${heightLimit}]+ba[ext=m4a]/bv*[vcodec^=avc1][height<=${heightLimit}]+ba/bv*[height<=${heightLimit}]+ba/b[height<=${heightLimit}]/b`;
 }
 
 function candidateClients() {
@@ -567,6 +537,7 @@ function candidateClients() {
   return list.slice(0, Math.max(1, MAX_CLIENT_ATTEMPTS));
 }
 
+/** Run `yt-dlp -j` and return the parsed JSON (metadata + selected format URLs + headers). */
 function runYtDlpJson(url, formatStr, client) {
   return new Promise((resolve, reject) => {
     const args = ['-j', '--no-playlist', '--playlist-items', '1', '--no-warnings', '--no-progress'];
@@ -599,67 +570,27 @@ function classifyStream(f) {
   if (hasV && hasA) return 'muxed';
   if (hasV) return 'video';
   if (hasA) return 'audio';
-  if (f.ext === 'mp4') return 'muxed';
   return 'unknown';
 }
 
-function makeStreamObj(d, f) {
-  const headers = { ...(d.http_headers || {}), ...(f.http_headers || {}) };
-  const hasCookie = Object.keys(headers).some((k) => k.toLowerCase() === 'cookie');
-  const cookies = f.cookies || d.cookies;
-  if (cookies && !hasCookie) headers.Cookie = cookies;
-  return {
-    url: f.url,
-    headers,
-    protocol: f.protocol || 'https',
-    kind: classifyStream(f),
-    ext: f.ext || '',
-    vcodec: f.vcodec || '',
-    width: f.width || null,
-    height: f.height || null,
-  };
-}
-
+/** Build a clean stream list { url, headers, protocol, kind, ext, height } from yt-dlp JSON. */
 function streamsFromJson(d) {
   const list = Array.isArray(d.requested_formats) && d.requested_formats.length ? d.requested_formats : [d];
-  return list.filter((f) => f && f.url).map((f) => makeStreamObj(d, f));
-}
-
-/**
- * Pick a single muxed H.264 MP4 stream from `d.formats` for instant browser `<video>` preview
- * on TikTok, Instagram, and Facebook (streamed directly via /api/preview with zero disk download).
- */
-function pickPreviewStreamFromJson(d, selectedStreams) {
-  if (Array.isArray(d.formats)) {
-    const muxedH264 = d.formats.filter(
-      (f) =>
-        f &&
-        f.url &&
-        /^https?$/.test(f.protocol || 'https') &&
-        f.ext === 'mp4' &&
-        f.vcodec &&
-        /^(avc1|h264)/i.test(f.vcodec) &&
-        f.acodec &&
-        f.acodec !== 'none'
-    );
-    if (muxedH264.length) {
-      return makeStreamObj(d, muxedH264[muxedH264.length - 1]);
-    }
-    const anyMuxedMp4 = d.formats.filter(
-      (f) =>
-        f &&
-        f.url &&
-        /^https?$/.test(f.protocol || 'https') &&
-        f.ext === 'mp4' &&
-        f.vcodec &&
-        f.vcodec !== 'none' &&
-        (f.acodec !== 'none' || !Array.isArray(d.requested_formats))
-    );
-    if (anyMuxedMp4.length) {
-      return makeStreamObj(d, anyMuxedMp4[anyMuxedMp4.length - 1]);
-    }
-  }
-  return selectedStreams.find((s) => s.kind === 'muxed') || selectedStreams[0] || null;
+  return list
+    .filter((f) => f && f.url)
+    .map((f) => {
+      const headers = { ...(d.http_headers || {}), ...(f.http_headers || {}) };
+      const hasCookie = Object.keys(headers).some((k) => k.toLowerCase() === 'cookie');
+      if (f.cookies && !hasCookie) headers.Cookie = f.cookies;
+      return {
+        url: f.url,
+        headers,
+        protocol: f.protocol || 'https',
+        kind: classifyStream(f),
+        ext: f.ext || '',
+        height: f.height || null,
+      };
+    });
 }
 
 function describeStreams(streams) {
@@ -668,16 +599,14 @@ function describeStreams(streams) {
 
 async function extractStreams(url, formatStr, client) {
   const d = await runYtDlpJson(url, formatStr, client);
-  const info = {
-    title: d.title || d.description?.slice(0, 80) || 'Video',
-    duration: d.duration || 0,
-    thumbnail: d.thumbnail || (Array.isArray(d.thumbnails) && d.thumbnails.length ? d.thumbnails[d.thumbnails.length - 1].url : ''),
-  };
-  const streams = streamsFromJson(d);
-  const previewStream = pickPreviewStreamFromJson(d, streams);
-  return { info, streams, previewStream };
+  const info = { title: d.title || 'YouTube Video', duration: d.duration || 0, thumbnail: d.thumbnail || '' };
+  return { info, streams: streamsFromJson(d) };
 }
 
+/**
+ * Ask googlevideo for the first byte(s) using the same headers ffmpeg will use.
+ * Uses an open-ended Range (like ffmpeg does) and aborts right after the response headers.
+ */
 async function probeStream(stream) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
@@ -698,16 +627,12 @@ async function probeStream(stream) {
   }
 }
 
-/** Check if the extracted stream actually meets 1080p when 1080p was requested. */
-function isTrue1080p(streams, heightLimit, isMp3) {
-  if (isMp3 || heightLimit < 1080) return true;
-  const v = streams.find((s) => s.kind === 'video' || s.kind === 'muxed');
-  if (!v || (!v.height && !v.width)) return true;
-  const maxDim = Math.max(v.width || 0, v.height || 0);
-  return maxDim > 1280 || (v.height || 0) > 720;
-}
-
-async function resolveDirectStreams(url, formatStr, cacheKey, maxClients = 0, platform = 'youtube', heightLimit = 1080, isMp3 = false) {
+/**
+ * Find stream URLs that YouTube will actually serve to ffmpeg.
+ * Tries cached streams first, then each player client in order until one passes the probe.
+ * Returns { streams, client } or null (→ caller uses the yt-dlp fallback).
+ */
+async function resolveDirectStreams(url, formatStr, cacheKey, maxClients = 0, platform = 'youtube') {
   const videoId = resolveMedia(url)?.key;
 
   const cached = getCachedStreams(cacheKey);
@@ -721,10 +646,9 @@ async function resolveDirectStreams(url, formatStr, cacheKey, maxClients = 0, pl
     streamCache.delete(cacheKey);
   }
 
+  // Player clients are a YouTube concept; other sites get a single attempt with yt-dlp's defaults.
   const allClients = platform === 'youtube' ? candidateClients() : [null];
   const clientsToTry = maxClients > 0 ? allClients.slice(0, maxClients) : allClients;
-  let bestLowerClient = null;
-
   for (const client of clientsToTry) {
     const label = client || platform;
     let result;
@@ -736,11 +660,8 @@ async function resolveDirectStreams(url, formatStr, cacheKey, maxClients = 0, pl
       continue;
     }
 
-    const { info, streams, previewStream } = result;
-    if (videoId) {
-      infoCache.set(videoId, { data: info, ts: Date.now() });
-      if (previewStream) previewStreamCache.set(videoId, { stream: previewStream, ts: Date.now() });
-    }
+    const { info, streams } = result;
+    if (videoId) infoCache.set(videoId, { data: info, ts: Date.now() });
 
     if (!streams.length) {
       console.warn(`[Direct] client=${label} returned no streams`);
@@ -755,33 +676,26 @@ async function resolveDirectStreams(url, formatStr, cacheKey, maxClients = 0, pl
     const probes = await Promise.all(streams.map(probeStream));
     console.log(`[Direct] client=${label} ${describeStreams(streams)} → probe ${probes.map((p) => p.status || p.error).join('/')}`);
     if (probes.every((p) => p.ok)) {
-      if (platform === 'youtube' && !isTrue1080p(streams, heightLimit, isMp3)) {
-        console.log(`[Direct] client=${label} only offered <=720p for 1080p request; checking next client…`);
-        if (!bestLowerClient) bestLowerClient = { streams, client: label };
-        continue;
-      }
       if (platform === 'youtube') workingClient = client;
       streamCache.set(cacheKey, { streams, client: label, ts: Date.now() });
       return { streams, client: label };
     }
   }
-
-  if (bestLowerClient) {
-    streamCache.set(cacheKey, { streams: bestLowerClient.streams, client: bestLowerClient.client, ts: Date.now() });
-    return bestLowerClient;
-  }
-
   return null;
 }
 
 // <<RANGE_PROXY_START>>
 // ─── Parallel range proxy ───────────────────────────────────────────────────
+// YouTube throttles a single long connection to about playback speed (a 60s clip takes ~60s).
+// ffmpeg reads from this local proxy instead of googlevideo. For every request the proxy
+// splits the byte range into small chunks, fetches several at once (each a short, bounded
+// Range request, the same trick yt-dlp's chunked downloader uses) and streams them back in order.
 const PROXY_ENABLED = (process.env.PARALLEL_FETCH ?? 'true').toLowerCase() !== 'false';
 const PROXY_CHUNK_BYTES = Math.max(256 * 1024, Math.round(parseFloat(process.env.FETCH_CHUNK_MB || '2') * 1_048_576));
 const PROXY_CONNECTIONS = Math.max(1, parseInt(process.env.FETCH_CONNECTIONS || '8', 10));
 const PROXY_CHUNK_RETRIES = 3;
 
-const rangeStreams = new Map();
+const rangeStreams = new Map();   // id → { url, headers, size, contentType, stats }
 let rangeProxyServer = null;
 let rangeProxyPort = 0;
 
@@ -812,6 +726,7 @@ async function fetchRangeChunk(entry, start, end, signal) {
       }
       if (!entry.contentType) entry.contentType = res.headers.get('content-type') || 'application/octet-stream';
       let buf = Buffer.from(await res.arrayBuffer());
+      // Server ignored the Range header and sent the whole file: cut out the part we asked for.
       if (res.status === 200 && (start > 0 || buf.length > end - start + 1)) {
         buf = buf.subarray(start, end + 1);
       }
@@ -827,6 +742,7 @@ async function fetchRangeChunk(entry, start, end, signal) {
   throw lastErr;
 }
 
+/** Total size of the remote file: the `clen` URL parameter if present, otherwise a 1-byte range probe. */
 async function ensureStreamSize(entry) {
   if (entry.size) return entry.size;
   try {
@@ -836,18 +752,10 @@ async function ensureStreamSize(entry) {
   const res = await fetch(entry.url, { headers: { ...entry.headers, Range: 'bytes=0-0' }, redirect: 'follow' });
   try { await res.body?.cancel(); } catch { /* */ }
   const m = (res.headers.get('content-range') || '').match(/\/(\d+)$/);
-  if (m) {
-    entry.size = parseInt(m[1], 10);
-    if (!entry.contentType) entry.contentType = res.headers.get('content-type') || 'application/octet-stream';
-    return entry.size;
-  }
-  const cl = parseInt(res.headers.get('content-length') || '', 10);
-  if (res.status === 200 && cl > 1) {
-    entry.size = cl;
-    if (!entry.contentType) entry.contentType = res.headers.get('content-type') || 'application/octet-stream';
-    return entry.size;
-  }
-  throw new Error(`could not determine stream size (HTTP ${res.status})`);
+  if (!m) throw new Error(`could not determine stream size (HTTP ${res.status})`);
+  entry.size = parseInt(m[1], 10);
+  if (!entry.contentType) entry.contentType = res.headers.get('content-type') || 'application/octet-stream';
+  return entry.size;
 }
 
 function waitDrain(res) {
@@ -871,7 +779,7 @@ async function handleRangeRequest(req, res) {
   const rm = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
   if (rm && (rm[1] !== '' || rm[2] !== '')) {
     partial = true;
-    if (rm[1] === '') { start = Math.max(0, size - parseInt(rm[2], 10)); }
+    if (rm[1] === '') { start = Math.max(0, size - parseInt(rm[2], 10)); }             // suffix range
     else { start = parseInt(rm[1], 10); if (rm[2] !== '') end = Math.min(end, parseInt(rm[2], 10)); }
   }
   if (start >= size || start > end) {
@@ -918,7 +826,7 @@ async function handleRangeRequest(req, res) {
   } catch (err) {
     if (!ac.signal.aborted) {
       console.warn(`[Proxy] stream failed: ${err.message}`);
-      res.destroy(err);
+      res.destroy(err);   // ffmpeg sees a broken download → the clip falls back to yt-dlp
     }
   } finally {
     ac.abort();
@@ -938,6 +846,7 @@ function startRangeProxy() {
   });
 }
 
+/** Returns a copy of `stream` that points at the local proxy. */
 function registerRangeStream(stream) {
   const id = crypto.randomBytes(8).toString('hex');
   rangeStreams.set(id, {
@@ -964,7 +873,12 @@ function releaseRangeStreams(streams) {
 // <<RANGE_PROXY_END>>
 
 // ─── ffmpeg helpers ─────────────────────────────────────────────────────────
+/**
+ * Input args for reading one remote YouTube stream.
+ * Headers come from yt-dlp (not guessed), so YouTube sees the same client it issued the URL to.
+ */
 function remoteInputArgs(stream, start, duration) {
+  // Streams routed through the local range proxy need no headers: the proxy adds them upstream.
   if (stream._proxyId) return ['-ss', String(start), '-t', String(duration), '-i', stream.url];
 
   const args = [];
@@ -979,6 +893,7 @@ function remoteInputArgs(stream, start, duration) {
     else headers['User-Agent'] = ua;
   }
 
+  // Each header line must end with \r\n (ffmpeg warns/ignores otherwise).
   const headerBlock = Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join('');
   if (headerBlock) args.push('-headers', headerBlock);
 
@@ -990,6 +905,10 @@ function remoteInputArgs(stream, start, duration) {
   return args;
 }
 
+/**
+ * Spawn an ffmpeg process, return { child, promise }.
+ * promise resolves when ffmpeg exits 0, rejects otherwise.
+ */
 function spawnFfmpeg(args, job, tag = 'ffmpeg') {
   const child = spawn(resolvedFfmpeg, args, { windowsHide: true });
   if (job) job.children.push(child);
@@ -1012,6 +931,7 @@ function spawnFfmpeg(args, job, tag = 'ffmpeg') {
   return { child, promise };
 }
 
+/** Parse `-progress pipe:1` output. cb(p) gets 0..1, or null for a heartbeat without a position. */
 function trackProgress(child, durationSec, cb) {
   let buf = '';
   child.stdout.on('data', (chunk) => {
@@ -1027,6 +947,7 @@ function trackProgress(child, durationSec, cb) {
   });
 }
 
+/** Fetch a single stream (video-only or audio-only) via ffmpeg -c copy */
 function startStreamFetch(stream, start, duration, outPath, isVideo, job) {
   const tag = isVideo ? 'ffmpeg-video-fetch' : 'ffmpeg-audio-fetch';
   const args = [
@@ -1038,6 +959,7 @@ function startStreamFetch(stream, start, duration, outPath, isVideo, job) {
   return spawnFfmpeg(args, job, tag);
 }
 
+/** Mux local video + audio files into a single mp4 */
 function muxLocal(videoPath, audioPath, outPath, job) {
   const args = [
     '-i', videoPath, '-i', audioPath,
@@ -1048,7 +970,8 @@ function muxLocal(videoPath, audioPath, outPath, job) {
   return spawnFfmpeg(args, job, 'ffmpeg-mux');
 }
 
-// ─── Direct path (stream URLs + parallel ffmpeg) ────────────────────────────
+// ─── Direct path (stream URLs + ffmpeg) ─────────────────────────────────────
+/** Returns the method label. Throws if YouTube/ffmpeg fails (caller falls back to yt-dlp). */
 async function runDirectPath(job, streams, { start, end, isMp3, exact, outPath, vPath, aPath, T }) {
   const dur = end - start;
 
@@ -1132,6 +1055,7 @@ async function runDirectPath(job, streams, { start, end, isMp3, exact, outPath, 
   trackProgress(vFetch.child, dur, (p) => { beat.t = Date.now(); if (p !== null) { vp = p; report(); } });
   trackProgress(aFetch.child, dur, (p) => { beat.t = Date.now(); if (p !== null) { ap = p; report(); } });
 
+  // Kill only if ffmpeg stops producing output (stalled connection), not just because it is slow.
   const stallTimer = setInterval(() => {
     if (Date.now() - beat.t > STALL_TIMEOUT_MS) { stalled = true; killJobChildren(job); }
   }, 2000);
@@ -1157,6 +1081,8 @@ async function runDirectPath(job, streams, { start, end, isMp3, exact, outPath, 
 }
 
 // ─── yt-dlp fallback downloader ─────────────────────────────────────────────
+// Note: with --download-sections yt-dlp hands the download to ffmpeg itself, so -N / chunk
+// size may be ignored. It works because yt-dlp sends the right headers for the chosen client.
 function ytdlpFallback(job, url, start, end, formatStr, outPath, isMp3 = false, client = null) {
   return new Promise((resolve, reject) => {
     const fileExt = isMp3 ? 'mp3' : 'mp4';
@@ -1222,6 +1148,7 @@ function ytdlpFallback(job, url, start, end, formatStr, outPath, isMp3 = false, 
   });
 }
 
+/** Fallback with one retry on a different player client if YouTube answers 403. */
 async function runYtdlpFallback(job, url, start, end, formatStr, outPath, isMp3, platform = 'youtube') {
   try {
     return await ytdlpFallback(job, url, start, end, formatStr, outPath, isMp3, null);
@@ -1248,7 +1175,7 @@ async function processClip(job, { url, start, end, format, quality, exact, title
   const media = resolveMedia(url);
   if (!media) throw new Error(UNSUPPORTED_MSG);
   const { platform } = media;
-  const videoId = media.key;
+  const videoId = media.key; // YouTube id, or a short hash for other sites
   const siteName = platform[0].toUpperCase() + platform.slice(1);
 
   job.mimeType = isMp3 ? 'audio/mpeg' : 'video/mp4';
@@ -1256,14 +1183,17 @@ async function processClip(job, { url, start, end, format, quality, exact, title
   const vPath = path.join(TEMP_DIR, `${job.id}_v.mp4`);
   const aPath = path.join(TEMP_DIR, `${job.id}_a.m4a`);
 
-  // Default to 1080p to match the UI default
-  const heightLimit = quality === '360p' ? 360 : quality === '720p' ? 720 : 1080;
-  const formatStr = buildFormat(heightLimit, isMp3, platform);
+  const heightLimit = quality === '1080p' ? 1080 : quality === '360p' ? 360 : 720;
+  const formatStr = buildFormat(heightLimit, isMp3, platform); // used by the yt-dlp fallback (the quality the user asked for)
 
+  // Heights to try on the fast direct path, best first. When YouTube refuses the
+  // 1080p stream URLs (403) we retry at 720p, which is usually still allowed,
+  // instead of dropping straight to the slow yt-dlp download. (YouTube only.)
   const heightPlan = [heightLimit];
   if (platform === 'youtube' && !isMp3 && QUALITY_FALLBACK && heightLimit > 720) heightPlan.push(720);
-  // Route all platforms through the parallel chunk proxy when available
-  const useProxy = Boolean(rangeProxyPort);
+  // The parallel range fetcher exists to beat YouTube's per-connection throttling.
+  // Other sites serve short clips at full speed and may not support Range, so they go direct.
+  const useProxy = platform === 'youtube' && Boolean(rangeProxyPort);
 
   job.requestedQuality = quality;
 
@@ -1272,7 +1202,8 @@ async function processClip(job, { url, start, end, format, quality, exact, title
     let client = '-';
     let finished = false;
 
-    // ── 1. Direct Fast Parallel Path (YouTube, TikTok, Instagram, Facebook) ──
+    // ── 1. Direct path ──
+    // The cooldown only tracks YouTube; a TikTok/Facebook failure must not switch off YouTube's fast path.
     if (USE_DIRECT_FFMPEG && (platform !== 'youtube' || Date.now() >= directDisabledUntil)) {
       let failReason = `${siteName} did not accept the direct stream URLs`;
 
@@ -1285,17 +1216,13 @@ async function processClip(job, { url, start, end, format, quality, exact, title
         if (i > 0) console.log(`[Clip ${job.id}] ${heightLimit}p was refused by YouTube, retrying direct path at ${h}p`);
 
         const te = Date.now();
-        const direct = await resolveDirectStreams(url, fStr, cKey, i === 0 ? 0 : 2, platform, h, isMp3);
+        // On the retry only try the first couple of clients, to keep the extra wait short.
+        const direct = await resolveDirectStreams(url, fStr, cKey, i === 0 ? 0 : 2, platform);
         T.extract += Date.now() - te;
 
         if (!direct) continue;
 
         client = direct.client;
-        // Detect if all clients only had <=720p for a 1080p request
-        if (h === 1080 && !isTrue1080p(direct.streams, 1080, isMp3)) {
-          job.downgradedTo = 720;
-        }
-
         const routed = useProxy ? direct.streams.map(registerRangeStream) : direct.streams;
         try {
           method = await runDirectPath(job, routed, { start, end, isMp3, exact, outPath, vPath, aPath, T });
@@ -1312,7 +1239,7 @@ async function processClip(job, { url, start, end, format, quality, exact, title
           streamCache.delete(cKey);
           failReason = err.message;
           console.warn(`[Clip ${job.id}] Direct path failed (${err.message}).`);
-          break;
+          break; // the URL was accepted but fetching failed: a lower quality will not help
         } finally {
           releaseRangeStreams(routed);
         }
@@ -1392,33 +1319,26 @@ app.post('/api/info', rateLimiter(15), async (req, res) => {
   const cached = getCachedInfo(vid);
   if (cached) {
     console.log(`[Info] Cache hit: ${vid}`);
+    if (platform !== 'youtube') ensurePreview(media).catch(() => { }); // warm the preview so the player starts fast
     return res.json({ ...cached, platform });
   }
 
-  // Pre-warm stream URLs at 1080p (matching the UI default) so clicking Download is instant
-  const fmt = buildFormat(1080, false, platform);
-  const clients = platform === 'youtube' ? candidateClients() : [null];
+  // One yt-dlp call returns the metadata AND the 720p stream URLs + headers.
+  // The URLs are cached, so the later "Download" click skips the 4-6s extraction step.
+  const fmt = buildFormat(720, false, platform);
+  const clients = platform === 'youtube' ? [workingClient || 'default'] : [null];
+  if (platform === 'youtube' && !clients.includes('default')) clients.push('default');
 
   let lastErr = null;
   for (const client of clients) {
     try {
-      const { info, streams, previewStream } = await extractStreams(cleanUrl, fmt, client);
+      const { info, streams } = await extractStreams(cleanUrl, fmt, client);
       infoCache.set(vid, { data: info, ts: Date.now() });
-      if (previewStream) {
-        previewStreamCache.set(vid, { stream: previewStream, ts: Date.now() });
+      if (streams.length) {
+        streamCache.set(streamCacheKey(vid, 720, false), { streams, client: client || platform, ts: Date.now() });
       }
-      if (streams.length && (platform !== 'youtube' || isTrue1080p(streams, 1080, false))) {
-        streamCache.set(streamCacheKey(vid, 1080, false), { streams, client: client || platform, ts: Date.now() });
-        if (platform === 'youtube') workingClient = client;
-        return res.json({ ...info, platform });
-      }
-      // If YouTube only has <=720p on this client, still return info if it's our last client
-      if (client === clients[clients.length - 1]) {
-        if (streams.length) {
-          streamCache.set(streamCacheKey(vid, 720, false), { streams, client: client || platform, ts: Date.now() });
-        }
-        return res.json({ ...info, platform });
-      }
+      if (platform !== 'youtube') ensurePreview(media).catch(() => { }); // warm the preview so the player starts fast
+      return res.json({ ...info, platform });
     } catch (err) {
       lastErr = err;
       if (err.fatal) break;
@@ -1427,69 +1347,8 @@ app.post('/api/info', rateLimiter(15), async (req, res) => {
   return res.status(400).json({ error: lastErr?.message || 'Metadata fetch failed.' });
 });
 
-/**
- * Direct Zero-Disk HTTP Stream Proxy for TikTok, Instagram, and Facebook `<video>` preview.
- * Streams bytes straight from the platform CDN with the exact headers/cookies yt-dlp extracted.
- */
-app.get('/api/preview', async (req, res) => {
-  const rawUrl = String(req.query.url || '').trim();
-  const media = resolveMedia(rawUrl);
-  if (!media) return res.status(400).json({ error: UNSUPPORTED_MSG });
-
-  const { platform, url: cleanUrl, key: vid } = media;
-
-  try {
-    let previewEntry = previewStreamCache.get(vid);
-    if (!previewEntry) {
-      const fmt = buildFormat(1080, false, platform);
-      const { info, streams, previewStream } = await extractStreams(cleanUrl, fmt, null);
-      infoCache.set(vid, { data: info, ts: Date.now() });
-      if (streams.length) {
-        streamCache.set(streamCacheKey(vid, 1080, false), { streams, client: platform, ts: Date.now() });
-      }
-      if (previewStream) {
-        previewEntry = { stream: previewStream, ts: Date.now() };
-        previewStreamCache.set(vid, previewEntry);
-      }
-    }
-
-    if (!previewEntry || !previewEntry.stream) {
-      return res.status(404).json({ error: 'No preview stream available.' });
-    }
-
-    const upstreamHeaders = cleanUpstreamHeaders(previewEntry.stream.headers);
-    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
-
-    const ac = new AbortController();
-    res.on('close', () => ac.abort());
-
-    const upstreamRes = await fetch(previewEntry.stream.url, {
-      headers: upstreamHeaders,
-      signal: ac.signal,
-      redirect: 'follow',
-    });
-
-    res.status(upstreamRes.status);
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    res.setHeader('Content-Type', upstreamRes.headers.get('content-type') || 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    const cl = upstreamRes.headers.get('content-length');
-    if (cl) res.setHeader('Content-Length', cl);
-    const cr = upstreamRes.headers.get('content-range');
-    if (cr) res.setHeader('Content-Range', cr);
-
-    if (upstreamRes.body) {
-      Readable.fromWeb(upstreamRes.body).on('error', () => { }).pipe(res);
-    } else {
-      res.end();
-    }
-  } catch (err) {
-    if (!res.headersSent) res.status(502).json({ error: err.message });
-  }
-});
-
 app.post('/api/clip', rateLimiter(10), (req, res) => {
-  const { url, start, end, format = 'mp4', quality = '1080p', exact = false, title = '' } = req.body || {};
+  const { url, start, end, format = 'mp4', quality = '720p', exact = false, title = '' } = req.body || {};
   const media = resolveMedia(url);
   if (!media) return res.status(400).json({ error: UNSUPPORTED_MSG });
   const s = parseFloat(start), e = parseFloat(end);
@@ -1542,6 +1401,230 @@ app.get('/api/download/:clipId', (req, res) => {
   res.on('finish', () => setTimeout(() => cleanupJob(job.id), 2000));
   stream.pipe(res);
 });
+
+// <<PREVIEW_START>>
+// ─── Preview for TikTok / Instagram / Facebook ──────────────────────────────
+// These sites' stream links only work with specific headers/cookies (and are often tied to the IP that asked),
+// so the browser can't play them directly. The server downloads a small preview copy once, keeps it for a
+// while, and serves it to the <video> tag with Range support (so seeking works).
+const PREVIEW_MAX_MB = Number(process.env.PREVIEW_MAX_MB) || 150;   // skip previews bigger than this
+const PREVIEW_TTL_MS = 30 * 60_000;
+const PREVIEW_FAIL_TTL_MS = 15_000;     // don't hammer a link that just failed
+const PREVIEW_TIMEOUT_MS = 120_000;
+const PREVIEW_CONCURRENCY = 3;          // simultaneous preview downloads
+const PREVIEW_STARTS_PER_MIN = 20;      // per IP
+
+const previewFiles = new Map();   // key → { file, type, ts }
+const previewJobs = new Map();    // key → Promise<entry> (download in progress)
+const previewFails = new Map();   // key → { message, ts }
+const previewStarts = new Map();  // ip → [timestamps]
+let previewActive = 0;
+const previewWaiters = [];
+
+function previewAcquire() {
+  if (previewActive < PREVIEW_CONCURRENCY) { previewActive++; return Promise.resolve(); }
+  return new Promise((r) => previewWaiters.push(r));
+}
+function previewRelease() {
+  const next = previewWaiters.shift();
+  if (next) next(); else previewActive--;
+}
+
+function allowPreviewStart(req) {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const now = Date.now();
+  const ts = (previewStarts.get(ip) || []).filter((t) => now - t < 60_000);
+  if (ts.length >= PREVIEW_STARTS_PER_MIN) { previewStarts.set(ip, ts); return false; }
+  ts.push(now);
+  previewStarts.set(ip, ts);
+  return true;
+}
+
+function previewMime(file) {
+  const ext = path.extname(file).toLowerCase();
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.mov') return 'video/quicktime';
+  return 'video/mp4';
+}
+
+function getPreviewFile(key) {
+  const c = previewFiles.get(key);
+  if (!c) return null;
+  if (!fs.existsSync(c.file)) { previewFiles.delete(key); return null; }
+  c.ts = Date.now();
+  return c;
+}
+
+// One progressive file the browser can play. Prefer H.264 (HEVC doesn't play in every browser), cap at 720p.
+function previewFormat() {
+  const h = 'height<=?720';
+  return `b[vcodec~='^(avc1|h264)'][${h}]/bv*[vcodec~='^(avc1|h264)'][${h}]+ba/b[${h}]/bv*[${h}]+ba/b`;
+}
+
+function removePreviewFiles(key) {
+  try {
+    for (const f of fs.readdirSync(TEMP_DIR)) {
+      if (f.startsWith(`preview_${key}.`)) { try { fs.unlinkSync(path.join(TEMP_DIR, f)); } catch { /* */ } }
+    }
+  } catch { /* */ }
+}
+
+function downloadPreview(media) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--no-playlist', '--playlist-items', '1', '--no-warnings', '--no-progress', '--no-part',
+      '-f', previewFormat(), '--merge-output-format', 'mp4',
+      '--max-filesize', `${PREVIEW_MAX_MB}M`,
+      '-o', path.join(TEMP_DIR, `preview_${media.key}.%(ext)s`),
+    ];
+    if (resolvedFfmpegDir) args.push('--ffmpeg-location', resolvedFfmpegDir);
+    args.push(...ytdlpCommonArgs(), media.url);
+
+    const child = spawn(resolvedYtDlp, args, { windowsHide: true });
+    let stderr = '';
+    let settled = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; clearTimeout(timer); fn(val); };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* */ }
+      removePreviewFiles(media.key);
+      finish(reject, mkErr('The preview took too long to download.', false));
+    }, PREVIEW_TIMEOUT_MS);
+
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (err) => {
+      finish(reject, err.code === 'ENOENT' ? mkErr('yt-dlp is not installed.', true) : mkErr(`yt-dlp: ${err.message}`, false));
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      if (code !== 0) {
+        removePreviewFiles(media.key);
+        return finish(reject, mapYtDlpError(stderr));
+      }
+      let found = null;
+      try {
+        found = fs.readdirSync(TEMP_DIR)
+          .filter((f) => f.startsWith(`preview_${media.key}.`) && !/\.(part|ytdl|temp)$/i.test(f))
+          .map((f) => path.join(TEMP_DIR, f))
+          .find((p) => { try { return fs.statSync(p).size > 0; } catch { return false; } });
+      } catch { /* */ }
+      if (!found) {
+        return finish(reject, mkErr(`This video is too large to preview (over ${PREVIEW_MAX_MB} MB). You can still download a clip.`, true));
+      }
+      finish(resolve, found);
+    });
+  });
+}
+
+/** Returns { file, type } for the preview of `media`, downloading it first if needed (shared between callers). */
+function ensurePreview(media) {
+  const hit = getPreviewFile(media.key);
+  if (hit) return Promise.resolve(hit);
+  const fail = previewFails.get(media.key);
+  if (fail && Date.now() - fail.ts < PREVIEW_FAIL_TTL_MS) return Promise.reject(mkErr(fail.message));
+  const running = previewJobs.get(media.key);
+  if (running) return running;
+
+  const p = (async () => {
+    await previewAcquire();
+    const t0 = Date.now();
+    try {
+      console.log(`[Preview] Downloading ${media.platform} preview ${media.key}`);
+      const file = await downloadPreview(media);
+      const entry = { file, type: previewMime(file), ts: Date.now() };
+      previewFiles.set(media.key, entry);
+      previewFails.delete(media.key);
+      console.log(`[Preview] Ready ${media.key} (${(fs.statSync(file).size / 1_048_576).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+      return entry;
+    } catch (err) {
+      previewFails.set(media.key, { message: err.message, ts: Date.now() });
+      console.warn(`[Preview] Failed ${media.key}: ${err.message}`);
+      throw err;
+    } finally {
+      previewRelease();
+      previewJobs.delete(media.key);
+    }
+  })();
+  previewJobs.set(media.key, p);
+  return p;
+}
+
+/** Serve a local file with HTTP Range support (needed for seeking in <video>). */
+function serveRanged(req, res, entry) {
+  let size;
+  try { size = fs.statSync(entry.file).size; } catch { return res.status(404).json({ error: 'Preview expired.' }); }
+  res.setHeader('Content-Type', entry.type);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'private, max-age=600');
+
+  let start = 0, end = size - 1, status = 200;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (m && (m[1] !== '' || m[2] !== '')) {
+    if (m[1] === '') {
+      start = Math.max(0, size - parseInt(m[2], 10));              // suffix range: last N bytes
+    } else {
+      start = parseInt(m[1], 10);
+      if (m[2] !== '') end = Math.min(parseInt(m[2], 10), size - 1);
+    }
+    if (start > end || start >= size) {
+      res.setHeader('Content-Range', `bytes */${size}`);
+      return res.status(416).end();
+    }
+    status = 206;
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+  }
+  res.status(status);
+  res.setHeader('Content-Length', end - start + 1);
+  if (req.method === 'HEAD') return res.end();
+  const stream = fs.createReadStream(entry.file, { start, end });
+  stream.on('error', () => res.destroy());
+  res.on('close', () => stream.destroy());
+  stream.pipe(res);
+}
+
+app.get('/api/preview', async (req, res) => {
+  const media = resolveMedia(String(req.query.url || ''));
+  if (!media) {
+    console.warn(`[Preview] Rejected link: ${String(req.query.url || '').slice(0, 120)}`);
+    return res.status(400).json({ error: UNSUPPORTED_MSG });
+  }
+  if (media.platform === 'youtube') return res.status(400).json({ error: 'YouTube previews use the embedded player.' });
+
+  const needsDownload = !getPreviewFile(media.key) && !previewJobs.has(media.key);
+  if (needsDownload && !allowPreviewStart(req)) {
+    return res.status(429).json({ error: 'Too many requests. Wait a minute.' });
+  }
+  try {
+    const entry = await ensurePreview(media);
+    serveRanged(req, res, entry);
+  } catch (err) {
+    if (!res.headersSent) res.status(502).json({ error: err.message });
+  }
+});
+
+/** Delete expired previews and leftovers. `orphanAgeMs` = how old an unknown preview_* file must be to go. */
+function sweepPreviews(orphanAgeMs) {
+  const now = Date.now();
+  for (const [k, v] of previewFiles) {
+    if (now - v.ts > PREVIEW_TTL_MS) { try { fs.unlinkSync(v.file); } catch { /* */ } previewFiles.delete(k); }
+  }
+  for (const [k, v] of previewFails) { if (now - v.ts > PREVIEW_FAIL_TTL_MS) previewFails.delete(k); }
+  for (const [ip, ts] of previewStarts) {
+    const r = ts.filter((t) => now - t < 60_000);
+    if (r.length) previewStarts.set(ip, r); else previewStarts.delete(ip);
+  }
+  try {
+    const known = new Set(Array.from(previewFiles.values(), (v) => v.file));
+    for (const f of fs.readdirSync(TEMP_DIR)) {
+      if (!f.startsWith('preview_')) continue;
+      const p = path.join(TEMP_DIR, f);
+      if (known.has(p) || previewJobs.has(f.slice(8, f.indexOf('.', 8)))) continue;
+      try { if (now - fs.statSync(p).mtimeMs >= orphanAgeMs) fs.unlinkSync(p); } catch { /* */ }
+    }
+  } catch { /* */ }
+}
+sweepPreviews(0);                                                     // leftovers from a previous run
+setInterval(() => sweepPreviews(PREVIEW_TTL_MS), 5 * 60_000).unref();
+// <<PREVIEW_END>>
 
 app.get('/api/health', (req, res) => {
   res.json({
